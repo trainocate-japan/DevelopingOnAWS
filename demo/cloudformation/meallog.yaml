@@ -1,34 +1,33 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  MealLog demo stack (Developing on AWS).
-  S3 (storage) -> DynamoDB -> Lambda -> API Gateway -> S3 (frontend) + CloudFront -> Cognito User Pool.
-  A serverless meal-logging application used to demonstrate the services covered in the course.
-  Each API operation is its own Lambda function, every function has prod/test
-  aliases + versions, ADOT (OpenTelemetry) X-Ray tracing is enabled, and API
-  Gateway selects the alias through the stage variable "lambdaAlias".
+  MealLog デモスタック (Developing on AWS)。
+  S3 (ストレージ) -> DynamoDB -> Lambda -> API Gateway -> S3 (フロントエンド) + CloudFront -> Cognito ユーザープール。
+  AWS の主要なサーバーレスサービスを体験するための食事記録アプリ。
+  API 操作ごとに Lambda を分割し、各関数は prod/test のエイリアス + バージョンを持つ。
+  ADOT (OpenTelemetry) による X-Ray トレースを有効化し、API Gateway は
+  ステージ変数 "lambdaAlias" でエイリアスを切り替える。
 
 # ---------------------------------------------------------------------------
-# Parameters
+# パラメータ
 # ---------------------------------------------------------------------------
 Parameters:
   ProjectName:
     Type: String
     Default: meallog
-    Description: Prefix used for naming resources. Lowercase letters, numbers and hyphens only.
+    Description: リソース名のプレフィックス。英小文字・数字・ハイフンのみ。
     AllowedPattern: "[a-z0-9-]+"
 
   LambdaCodeBucket:
     Type: String
     Description: >
-      Name of the S3 bucket that holds the Lambda deployment packages.
-      Created and populated by deploy.sh.
+      Lambda のデプロイパッケージを置く S3 バケット名。deploy.sh が作成・配置する。
 
   AdotLayerArn:
     Type: String
     Default: "arn:aws:lambda:us-east-1:901920570463:layer:aws-otel-python-amd64-ver-1-32-0:3"
     Description: >
-      ARN of the AWS Distro for OpenTelemetry (ADOT) Python Lambda layer used
-      for X-Ray tracing. Must match the stack region and the function runtime.
+      X-Ray トレース用の ADOT (AWS Distro for OpenTelemetry) Python Lambda
+      レイヤーの ARN。スタックのリージョンと関数ランタイムに一致させること。
 
   PutMealKey:
     Type: String
@@ -80,25 +79,25 @@ Parameters:
     Description: 説明生成に使う Bedrock モデル ID（SSM パラメータの既定値）。
 
 # ---------------------------------------------------------------------------
-# Conditions
+# 条件 (Conditions)
 # ---------------------------------------------------------------------------
 Conditions:
   # Pillow レイヤー ARN が渡されたときだけ画像処理 Lambda にアタッチする。
   HasPillowLayer: !Not [!Equals [!Ref PillowLayerArn, ""]]
 
 # ---------------------------------------------------------------------------
-# Resources
+# リソース (Resources)
 # ---------------------------------------------------------------------------
 Resources:
 
   # =========================================================================
-  # DynamoDB : the meal records table
+  # DynamoDB : 食事記録テーブル
   #   PK = UserId
-  #   SK = MealKey  ("YYYY-MM-DD#breakfast|lunch|dinner")
+  #   SK = MealKey  ("<日付>#<時間帯番号 1|2|3>")
   #   LSI RatingIndex : PK = UserId, SK = Rating (1-5)
-  #   GSI FavoriteIndex (sparse) : PK = FavoriteFlag, SK = MealDate
-  #     FavoriteFlag exists only when a record is a favorite, so the index is
-  #     sparse and stores favorites only (saves storage + write capacity).
+  #   GSI FavoriteIndex (スパース) : PK = FavoriteFlag, SK = MealDate
+  #     FavoriteFlag はお気に入り項目にだけ付与されるため、インデックスは
+  #     スパースになりお気に入りだけを保持（ストレージと書き込み容量を節約）。
   # =========================================================================
   MealsTable:
     Type: AWS::DynamoDB::Table
@@ -141,7 +140,7 @@ Resources:
             ProjectionType: ALL
 
   # =========================================================================
-  # Cognito : user pool + app client
+  # Cognito : ユーザープール + アプリクライアント
   # =========================================================================
   UserPool:
     Type: AWS::Cognito::UserPool
@@ -168,8 +167,8 @@ Resources:
           Mutable: true
           Required: false
       LambdaConfig:
-        # PreSignUp auto-confirms the user (no email verification needed) and
-        # PostConfirmation runs the "user activated" automation.
+        # PreSignUp はユーザーを自動確認（メール検証不要）し、
+        # PostConfirmation は「アクティベート後処理」を実行する。
         PreSignUp: !GetAtt CognitoTriggerFunction.Arn
         PostConfirmation: !GetAtt CognitoTriggerFunction.Arn
 
@@ -194,7 +193,7 @@ Resources:
       SourceArn: !GetAtt UserPool.Arn
 
   # =========================================================================
-  # IAM roles
+  # IAM ロール
   # =========================================================================
   CognitoTriggerRole:
     Type: AWS::IAM::Role
@@ -230,7 +229,7 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-        # ADOT/X-Ray needs permission to send trace segments.
+        # ADOT/X-Ray がトレースセグメントを送信するための権限。
         - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
       Policies:
         - PolicyName: dynamodb-access
@@ -251,7 +250,7 @@ Resources:
                   - !Sub "${MealsTable.Arn}/index/*"
 
   # =========================================================================
-  # Cognito trigger Lambda (not part of the API; no alias needed)
+  # Cognito トリガー Lambda（API ではないのでエイリアス不要）
   # =========================================================================
   CognitoTriggerFunction:
     Type: AWS::Lambda::Function
@@ -271,10 +270,10 @@ Resources:
         S3Key: !Ref CognitoTriggerKey
 
   # =========================================================================
-  # API Lambda functions (one per operation).
-  # Each: Tracing Active + ADOT layer + wrapper, a published Version, and
-  # prod/test aliases. The deploy script re-publishes versions and repoints
-  # the aliases after uploading fresh code.
+  # API Lambda 関数（1 操作につき 1 関数）。
+  # いずれも Tracing 有効 + ADOT レイヤー + ラッパー、発行済みバージョン、
+  # prod/test エイリアスを持つ。deploy.sh が新コードのアップロード後に
+  # バージョンを再発行し、エイリアスを付け替える。
   # =========================================================================
 
   # ---- put_meal ----
@@ -503,15 +502,15 @@ Resources:
       FunctionVersion: !GetAtt QueryFavoriteVersion.Version
 
   # =========================================================================
-  # API Gateway (REST API) with a Cognito authorizer + Lambda proxy.
-  # The integration URIs embed the stage variable "lambdaAlias" so the prod
-  # stage calls the :prod aliases and the test stage calls the :test aliases.
+  # API Gateway (REST API) : Cognito オーソライザー + Lambda プロキシ。
+  # 統合 URI にステージ変数 "lambdaAlias" を埋め込み、prod ステージは :prod
+  # エイリアス、test ステージは :test エイリアスを呼び出す。
   #
   #   GET    /meals                -> list_recent
   #   POST   /meals                -> put_meal
   #   DELETE /meals/{mealKey}      -> delete_meal
   #   GET    /meals/search/rating  -> query_rating (LSI)
-  #   GET    /meals/favorites      -> query_favorite (sparse GSI)
+  #   GET    /meals/favorites      -> query_favorite (スパース GSI)
   # =========================================================================
   RestApi:
     Type: AWS::ApiGateway::RestApi
@@ -530,7 +529,7 @@ Resources:
       ProviderARNs:
         - !GetAtt UserPool.Arn
 
-  # ---- resources ----
+  # ---- リソース ----
   MealsResource:
     Type: AWS::ApiGateway::Resource
     Properties:
@@ -562,9 +561,9 @@ Resources:
       ParentId: !Ref MealsResource
       PathPart: favorites
 
-  # ---- methods ----
-  # NOTE: the ":${stageVariables.lambdaAlias}" suffix on the function ARN makes
-  # API Gateway invoke the alias named by the stage variable (prod or test).
+  # ---- メソッド ----
+  # 注: 関数 ARN 末尾の ":${stageVariables.lambdaAlias}" により、API Gateway は
+  # ステージ変数で指定したエイリアス（prod または test）を呼び出す。
   ListRecentMethod:
     Type: AWS::ApiGateway::Method
     Properties:
@@ -630,7 +629,7 @@ Resources:
         IntegrationHttpMethod: POST
         Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${QueryFavoriteFunction.Arn}:${!stageVariables.lambdaAlias}/invocations"
 
-  # ---- CORS preflight (MOCK) ----
+  # ---- CORS プリフライト (MOCK) ----
   MealsOptions:
     Type: AWS::ApiGateway::Method
     Properties:
@@ -727,8 +726,8 @@ Resources:
             method.response.header.Access-Control-Allow-Methods: true
             method.response.header.Access-Control-Allow-Origin: true
 
-  # ---- Lambda invoke permissions (per alias) ----
-  # API Gateway must be allowed to invoke each prod and test alias.
+  # ---- Lambda 呼び出し許可（エイリアスごと）----
+  # API Gateway が prod / test 両エイリアスを呼び出せるようにする。
   PutMealPermProd:
     Type: AWS::Lambda::Permission
     Properties:
@@ -804,7 +803,7 @@ Resources:
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/*"
 
-  # ---- deployment + two stages (prod/test) selecting the alias ----
+  # ---- デプロイ + エイリアスを選ぶ 2 ステージ (prod/test) ----
   ApiDeployment:
     Type: AWS::ApiGateway::Deployment
     DependsOn:
@@ -859,7 +858,7 @@ Resources:
           ThrottlingBurstLimit: 40
 
   # =========================================================================
-  # Frontend hosting : private S3 bucket behind CloudFront (OAC)
+  # フロントエンドのホスティング : CloudFront(OAC) 配下の非公開 S3 バケット
   # =========================================================================
   FrontendBucket:
     Type: AWS::S3::Bucket
@@ -938,7 +937,7 @@ Resources:
           AllowedMethods: [GET, HEAD, OPTIONS]
           CachedMethods: [GET, HEAD]
           Compress: true
-          # CachingDisabled managed policy so config.js updates appear immediately.
+          # CachingDisabled マネージドポリシー（config.js の更新が即反映されるように）。
           CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
         CustomErrorResponses:
           - ErrorCode: 403
@@ -1433,7 +1432,7 @@ Resources:
     Properties: { Action: lambda:InvokeFunction, FunctionName: !Ref GetImageUrlAliasTest, Principal: apigateway.amazonaws.com, SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/*" }
 
 # ---------------------------------------------------------------------------
-# Outputs (consumed by deploy.sh)
+# 出力 (Outputs) : deploy.sh が参照する
 # ---------------------------------------------------------------------------
 Outputs:
   Region:
@@ -1445,13 +1444,13 @@ Outputs:
   UserPoolClientId:
     Value: !Ref UserPoolClient
   ApiBaseUrl:
-    Description: Base URL of the PROD stage (prod aliases)
+    Description: PROD ステージのベース URL（prod エイリアス）
     Value: !Sub "https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
   ApiBaseUrlTest:
-    Description: Base URL of the TEST stage (test aliases)
+    Description: TEST ステージのベース URL（test エイリアス）
     Value: !Sub "https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/test"
   ApiFunctionNames:
-    Description: Comma separated API Lambda function names (used by deploy.sh to publish versions)
+    Description: API Lambda 関数名のカンマ区切り（deploy.sh がバージョン発行に使用）
     Value: !Join
       - ","
       - - !Ref PutMealFunction
@@ -1472,8 +1471,8 @@ Outputs:
   CloudFrontDistributionId:
     Value: !Ref CloudFrontDistribution
   FrontendWebAclArn:
-    Description: WAF WebACL (CloudFront) protecting the UI with a rate-based rule
+    Description: UI をレートベースルールで保護する WAF WebACL (CloudFront)
     Value: !GetAtt FrontendWebAcl.Arn
   AppUrl:
-    Description: Open this URL to use the app
+    Description: この URL を開いてアプリを利用する
     Value: !Sub "https://${CloudFrontDistribution.DomainName}"
