@@ -205,7 +205,8 @@ REST API には **`prod` と `test` の 2 ステージ** があり、それぞ�
 │   │   ├── index.html
 │   │   ├── app.js
 │   │   ├── styles.css
-│   │   └── config.js          # deploy.sh が自動生成（ユーザープール ID 等）
+│   │   ├── config.sample.js   # config.js の雛形（リポジトリで管理）
+│   │   └── config.js          # deploy.sh が自動生成（git 管理外）
 │   └── scripts/
 │       ├── deploy.sh          # ビルド & デプロイ
 │       ├── seed_data.sh       # デモ用ユーザー + サンプルデータ投入（任意）

@@ -88,4 +88,7 @@ coverage/
 .build/
 demo/.build/
 
+# Generated at deploy time (see demo/frontend/config.sample.js for the format)
+demo/frontend/config.js
+
 text/

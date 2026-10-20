@@ -220,7 +220,8 @@ echo "   wrote frontend/config.js"
 
 # --- 6. Upload the frontend ---------------------------------------------------
 echo ">> Uploading frontend to s3://${FRONTEND_BUCKET}"
-"${AWS[@]}" s3 sync "${FRONTEND_DIR}" "s3://${FRONTEND_BUCKET}" --delete --exclude ".DS_Store"
+"${AWS[@]}" s3 sync "${FRONTEND_DIR}" "s3://${FRONTEND_BUCKET}" --delete \
+  --exclude ".DS_Store" --exclude "config.sample.js"
 
 # --- 7. Invalidate CloudFront -------------------------------------------------
 echo ">> Invalidating CloudFront cache"
