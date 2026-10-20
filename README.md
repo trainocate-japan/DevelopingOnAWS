@@ -5,27 +5,25 @@
 > Cognito / SNS / SQS / WAF / Bedrock など）を作成します。**デプロイしている間や、
 > 画像アップロードで Bedrock(Nova) を呼び出すたびに料金が発生します。**
 > 料金・セキュリティ・運用のすべてはデプロイする方の責任で管理してください。
-> コースやデモが終わったら、必ず [クリーンアップ](#7-クリーンアップ) を実行してリソースを削除してください。
+> デモが終わったら、必ず [クリーンアップ](#7-クリーンアップ) を実行してリソースを削除してください。
 > 本リポジトリの内容は無保証（AS IS）で提供されます。
 
-コース「Developing on AWS」で扱うサービスを、1 本のサーバーレスアプリとして体験するためのデモ環境です。
-受講者が **新規サインアップ → サインイン → 食事データの登録・検索（＋料理写真のアップロード）** まで実際に触れます。
+AWS の主要なサーバーレスサービスを、1 本のアプリとして体験するためのデモ環境です。
+利用者が **新規サインアップ → サインイン → 食事データの登録・検索（＋料理写真のアップロード）** まで実際に触れます。
 
 実体は `demo/` 配下にまとまっています（CloudFormation テンプレート・Lambda コード・フロントエンド・各種スクリプト）。
 
-テキストで解説する流れ、
+次のような構成を 1 つのアプリで通して確認できます。
 
 ```
 S3 (ストレージ) → DynamoDB → Lambda → API Gateway → S3 (フロントエンド) + CloudFront → Cognito ユーザープール
 ```
 
-をそのまま 1 つのアプリで通して見せられるように作っています。
-
 ---
 
 ## 1. アプリ概要（テーマ: 健康管理 / 食事記録）
 
-食べたものを記録する「MealLog」。1 件の記録は次の属性を持ちます。
+食べたものを記録する健康管理アプリ「MealLog」。1 件の記録は次の属性を持ちます。
 
 | 項目 | 説明 |
 |------|------|
@@ -35,20 +33,24 @@ S3 (ストレージ) → DynamoDB → Lambda → API Gateway → S3 (フロン�
 | 評価 | 星 5 段階 (1〜5) |
 | お気に入り | ON/OFF。**OFF のときは属性そのものを付与しない** |
 
-> ラボで扱う User / Note 管理とはテーマをずらし、食事記録にしています。
-
 ---
 
-## 2. アーキテクチャと「テキストのどこを説明できるか」
+## 2. アーキテクチャ
 
-| コースのモジュール | このデモでの対応箇所 |
+このデモで使用している主な AWS サービスと、その使いどころです。
+
+| サービス | このデモでの使いどころ |
 |---|---|
-| M5/M6 ストレージ (S3・静的ホスティング・CORS) | フロントエンドを S3 に配置し CloudFront 経由で配信。API 呼び出しは CORS 対応 |
-| M7/M8 データベース (DynamoDB・キー設計・LSI・GSI・Query/Scan・条件付き書き込み) | `meallog-meals` テーブル。複合ソートキー・LSI・スパース GSI・条件付き削除 |
-| M9 コンピュート (Lambda・Python・環境変数・トリガー・バージョン/エイリアス・ログ) | 機能ごとに分割した Lambda 群。prod/test エイリアス + バージョン、INFO ログ、ADOT トレース |
-| M10 API 管理 (API Gateway・REST・ステージ・ステージ変数・Cognito オーソライザー) | REST API。prod/test ステージをステージ変数で切替え、Cognito オーソライザーで保護 |
-| M12 アクセス (Cognito・ユーザープール・JWT) | ユーザープールでサインアップ/サインイン。JWT を API の認可に使用 |
-| 画像アップロード（追加仕様） | S3 署名付き URL アップロード → SNS → SQS×2(各DLQ) → Lambda(Pillow画像処理 / Bedrock説明生成) |
+| Amazon S3 | フロントエンド（静的ホスティング）、画像のアップロード／出力バケット |
+| Amazon CloudFront | フロントエンド配信（WAF・OAC 付き） |
+| Amazon DynamoDB | 食事記録の保存。複合ソートキー・LSI・スパース GSI・条件付き書き込み |
+| AWS Lambda | API 処理と非同期の画像処理。バージョン/エイリアス、JSON ログ、ADOT トレース |
+| Amazon API Gateway | REST API。prod/test ステージをステージ変数で切替え、Cognito オーソライザーで保護 |
+| Amazon Cognito | ユーザープールでサインアップ/サインイン。JWT を API の認可に使用 |
+| Amazon SNS / SQS | 画像アップロードイベントのファンアウトと非同期処理（DLQ 付き） |
+| Amazon Bedrock | 料理画像の説明文を自動生成（Nova Lite） |
+| AWS WAF | UI へのレートベースブロック |
+| AWS Systems Manager（パラメータストア） | 説明生成のシステムプロンプト／モデル ID の設定 |
 
 ### 画像アップロード機能（追加仕様）のアーキテクチャ
 
@@ -81,12 +83,12 @@ SNS トピック (meallog-image-events)
 ### セキュリティ / レート制御
 
 - **Cognito オーソライザー**: データを扱う全 API メソッドは `COGNITO_USER_POOLS` で保護（OPTIONS のみ CORS プリフライト用に NONE）。
-- **API Gateway ステージスロットリング**（受講者最大 20 名想定）: prod = レート 50 req/s・バースト 100、test = レート 20 req/s・バースト 40。
+- **API Gateway ステージスロットリング**（同時利用 最大 20 名程度を想定）: prod = レート 50 req/s・バースト 100、test = レート 20 req/s・バースト 40。
 - **WAF（CloudFront 用 WebACL）**: UI に IP 単位のレートベースブロック。**5 分あたり 2000 リクエスト/IP** を超えるとブロック。
 
 ### データモデル（DynamoDB `meallog-meals`）
 
-指示どおりのキー設計です。
+キー設計は次のとおりです。
 
 - **パーティションキー (PK)**: `UserId` … Cognito の `sub`
 - **ソートキー (SK)**: `MealKey` = `"<日付>#<1|2|3>"`（日付 + 時間帯の混合キー。**朝=1 / 昼=2 / 夜=3** と数値化）
@@ -110,7 +112,7 @@ SNS トピック (meallog-image-events)
 - **お気に入りの日付範囲検索（GSI）**: GSI のソートキー `MealDate` に対して、日付範囲（`BETWEEN` / `>=` / `<=`）で
   絞り込めます。全ユーザーのお気に入りが対象で、こちらも `KeyConditionExpression` のみです。
 - **最近の記録 / 評価検索の対象ユーザー切替え**: 既定は自分のデータですが、画面の「対象ユーザー」で
-  サンプルユーザー (`demofan100`) に切り替えられます。自分のデータが無い受講者でも検索結果を確認できます
+  サンプルユーザー (`demofan100`) に切り替えられます。自分のデータが無い利用者でも検索結果を確認できます
   （API 側は `?userId=<sub>` で対象を指定。デモ用途のため所有者チェックは行いません）。
 - **お気に入りは全員共通**: お気に入り一覧は対象ユーザーに関係なく全員分を表示し、各行に登録者名を出します。
   登録フォームのお気に入りチェックボックスには「チェックを入れると他の人にも表示されます」と注意書きを表示します。
@@ -161,17 +163,17 @@ REST API には **`prod` と `test` の 2 ステージ** があり、それぞ�
 2. メールアドレスは一律 `<ユーザー名>@example.com`、表示名 (nickname) も自動付与。
 3. サインアップ時に **PreSignUp Lambda** が `autoConfirmUser=true` / `autoVerifyEmail=true` を返すため、
    メール検証なしで即アクティベート（**PostConfirmation Lambda** も発火）。
-4. 作成後、**ログイン情報を画面に表示**。受講者はその情報でサインインします
+4. 作成後、**ログイン情報を画面に表示**。利用者はその情報でサインインします
    （サインアップ → サインインの流れをそのまま体験できます）。
 
-> 指示の「自動ログインできなければ、新規作成後にログイン情報を画面に表示」に沿い、
-> 今回は **サインアップ → 手動サインイン** を見せる構成にしています。
+> 自動ログインはせず、**サインアップ → 手動サインイン** を見せる構成にしています
+> （新規作成後にログイン情報を画面へ表示）。
 
 ---
 
 ## 3. 前提
 
-- AWS CLI v2 がインストール済みで、プロファイル **`tr-yamashitam`**（または任意のプロファイル）で `sts get-caller-identity` が通ること
+- AWS CLI v2 がインストール済みで、使用する AWS プロファイルで `sts get-caller-identity` が通ること（プロファイルは環境変数 `AWS_PROFILE` で指定）
 - `zip`, `python3`（+ `pip`）, `bash`, `curl` が使えること
 - リージョンは **`us-east-1`**
 - デプロイ先アカウントで CloudFormation / Lambda / DynamoDB / API Gateway / Cognito / CloudFront / S3 / IAM / X-Ray / SNS / SQS / SSM / WAF / Bedrock を作成・利用できる権限
@@ -272,16 +274,15 @@ AWS_PROFILE=別プロファイル AWS_REGION=us-east-1 ./demo/scripts/deploy.sh
 
 ## 6. カスタムドメイン (ACM / Route 53) を後から付ける場合
 
-予定ドメイン: **`doademo.aws.trainocate.biz`**
+CloudFront はまずデフォルトドメインで動く状態にしてあります。独自ドメインを使う場合は手動設定する前提です
+（以下では `your-domain.example.com` をお使いのドメインに読み替えてください）。
 
-CloudFront はまずデフォルトドメインで動く状態にしてあります。独自ドメインは手動設定する前提です。
-
-1. **ACM 証明書**を **`us-east-1`** で `doademo.aws.trainocate.biz` に対して発行（DNS 検証）
+1. **ACM 証明書**を **`us-east-1`** で対象ドメインに対して発行（DNS 検証）
 2. `demo/cloudformation/meallog.yaml` の `CloudFrontDistribution` に以下を追加して再デプロイ
-   - `DistributionConfig.Aliases: [doademo.aws.trainocate.biz]`
+   - `DistributionConfig.Aliases: [your-domain.example.com]`
    - `ViewerCertificate` を `CloudFrontDefaultCertificate: true` から
      `AcmCertificateArn` / `SslSupportMethod: sni-only` / `MinimumProtocolVersion: TLSv1.2_2021` に差し替え
-3. **Route 53** で `doademo.aws.trainocate.biz` の A/AAAA エイリアスレコードを CloudFront ディストリビューションに向ける
+3. **Route 53**（または利用中の DNS）で対象ドメインの A/AAAA エイリアスレコードを CloudFront ディストリビューションに向ける
 
 > CloudFront 用の ACM 証明書は **必ず us-east-1** で発行する必要があります（本デモは元々 us-east-1 なので問題ありません）。
 
@@ -289,7 +290,7 @@ CloudFront はまずデフォルトドメインで動く状態にしてありま
 
 ## 7. クリーンアップ
 
-**コースやデモが終わったら、課金を止めるため必ず実行してください。**
+**デモが終わったら、課金を止めるため必ず実行してください。**
 
 ```bash
 ./demo/scripts/cleanup.sh

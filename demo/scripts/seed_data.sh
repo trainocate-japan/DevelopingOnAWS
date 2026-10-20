@@ -12,7 +12,7 @@
 #   ./seed_data.sh
 #
 # Environment overrides (must match deploy.sh):
-#   AWS_PROFILE   (default: tr-yamashitam)
+#   AWS_PROFILE   (未指定なら既定プロファイル)
 #   AWS_REGION    (default: us-east-1)
 #   PROJECT_NAME  (default: meallog)
 #   STACK_NAME    (default: meallog-demo)
@@ -21,7 +21,7 @@
 #
 set -euo pipefail
 
-AWS_PROFILE="${AWS_PROFILE:-tr-yamashitam}"
+AWS_PROFILE="${AWS_PROFILE:-}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 PROJECT_NAME="${PROJECT_NAME:-meallog}"
 STACK_NAME="${STACK_NAME:-meallog-demo}"
@@ -29,7 +29,8 @@ SEED_USERNAME="${SEED_USERNAME:-demofan100}"
 SEED_PASSWORD="${SEED_PASSWORD:-Demo100log!}"
 SEED_EMAIL="${SEED_USERNAME}@example.com"
 
-AWS=(aws --profile "${AWS_PROFILE}" --region "${AWS_REGION}")
+AWS=(aws --region "${AWS_REGION}")
+[ -n "${AWS_PROFILE}" ] && AWS+=(--profile "${AWS_PROFILE}")
 
 get_output() {
   "${AWS[@]}" cloudformation describe-stacks --stack-name "${STACK_NAME}" \

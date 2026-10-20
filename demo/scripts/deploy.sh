@@ -15,12 +15,13 @@
 # Usage: ./deploy.sh
 #
 # Environment overrides:
-#   AWS_PROFILE  (default tr-yamashitam)   AWS_REGION   (default us-east-1)
+#   AWS_PROFILE  (未指定なら既定プロファイル)  AWS_REGION   (default us-east-1)
 #   PROJECT_NAME (default meallog)         STACK_NAME   (default meallog-demo)
 #
 set -euo pipefail
 
-AWS_PROFILE="${AWS_PROFILE:-tr-yamashitam}"
+# AWS_PROFILE は未指定なら設定しない（既定プロファイル / 環境変数 AWS_PROFILE を使用）。
+AWS_PROFILE="${AWS_PROFILE:-}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 PROJECT_NAME="${PROJECT_NAME:-meallog}"
 STACK_NAME="${STACK_NAME:-meallog-demo}"
@@ -32,7 +33,8 @@ LAMBDA_DIR="${DEMO_DIR}/lambda"
 FRONTEND_DIR="${DEMO_DIR}/frontend"
 BUILD_DIR="${DEMO_DIR}/.build"
 
-AWS=(aws --profile "${AWS_PROFILE}" --region "${AWS_REGION}")
+AWS=(aws --region "${AWS_REGION}")
+[ -n "${AWS_PROFILE}" ] && AWS+=(--profile "${AWS_PROFILE}")
 
 # API 関数（common.py を同梱し、version + prod/test エイリアスを持つ）
 API_FUNCS=(put_meal delete_meal list_recent query_rating query_favorite get_upload_url get_image_url)
@@ -41,7 +43,7 @@ WORKER_FUNCS=(process_image describe_image)
 
 echo "=============================================="
 echo " MealLog demo deploy"
-echo "   profile : ${AWS_PROFILE}"
+echo "   profile : ${AWS_PROFILE:-(default)}"
 echo "   region  : ${AWS_REGION}"
 echo "   stack   : ${STACK_NAME}"
 echo "=============================================="

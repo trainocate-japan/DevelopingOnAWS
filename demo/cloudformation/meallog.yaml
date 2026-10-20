@@ -923,9 +923,9 @@ Resources:
         # UI（CloudFront）に WAF のレートベースブロックを適用。
         WebACLId: !GetAtt FrontendWebAcl.Arn
         DefaultRootObject: index.html
-        # To attach doademo.aws.trainocate.biz later: add Aliases + a
-        # ViewerCertificate referencing an ACM cert in us-east-1, then create
-        # the Route 53 record pointing at this distribution.
+        # カスタムドメインを後から付ける場合: Aliases と ViewerCertificate
+        # (us-east-1 の ACM 証明書) を追加し、DNS(Route 53 等) のエイリアス
+        # レコードをこのディストリビューションに向ける。
         Origins:
           - Id: s3-frontend
             DomainName: !GetAtt FrontendBucket.RegionalDomainName
