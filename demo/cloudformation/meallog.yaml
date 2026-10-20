@@ -1,0 +1,1479 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  MealLog demo stack (Developing on AWS).
+  S3 (storage) -> DynamoDB -> Lambda -> API Gateway -> S3 (frontend) + CloudFront -> Cognito User Pool.
+  A serverless meal-logging application used to demonstrate the services covered in the course.
+  Each API operation is its own Lambda function, every function has prod/test
+  aliases + versions, ADOT (OpenTelemetry) X-Ray tracing is enabled, and API
+  Gateway selects the alias through the stage variable "lambdaAlias".
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+  ProjectName:
+    Type: String
+    Default: meallog
+    Description: Prefix used for naming resources. Lowercase letters, numbers and hyphens only.
+    AllowedPattern: "[a-z0-9-]+"
+
+  LambdaCodeBucket:
+    Type: String
+    Description: >
+      Name of the S3 bucket that holds the Lambda deployment packages.
+      Created and populated by deploy.sh.
+
+  AdotLayerArn:
+    Type: String
+    Default: "arn:aws:lambda:us-east-1:901920570463:layer:aws-otel-python-amd64-ver-1-32-0:3"
+    Description: >
+      ARN of the AWS Distro for OpenTelemetry (ADOT) Python Lambda layer used
+      for X-Ray tracing. Must match the stack region and the function runtime.
+
+  PutMealKey:
+    Type: String
+    Default: lambda/put_meal.zip
+  DeleteMealKey:
+    Type: String
+    Default: lambda/delete_meal.zip
+  ListRecentKey:
+    Type: String
+    Default: lambda/list_recent.zip
+  QueryRatingKey:
+    Type: String
+    Default: lambda/query_rating.zip
+  QueryFavoriteKey:
+    Type: String
+    Default: lambda/query_favorite.zip
+  CognitoTriggerKey:
+    Type: String
+    Default: lambda/cognito_triggers.zip
+
+  # ---- 画像機能（追加仕様）の Lambda パッケージ ----
+  GetUploadUrlKey:
+    Type: String
+    Default: lambda/get_upload_url.zip
+  GetImageUrlKey:
+    Type: String
+    Default: lambda/get_image_url.zip
+  ProcessImageKey:
+    Type: String
+    Default: lambda/process_image.zip
+  DescribeImageKey:
+    Type: String
+    Default: lambda/describe_image.zip
+
+  PillowLayerArn:
+    Type: String
+    Description: >
+      Pillow(画像処理)を同梱した自前 Lambda レイヤーの ARN。deploy.sh が
+      manylinux 向けにビルド/発行して渡す。
+    Default: ""
+
+  DescribeSystemPrompt:
+    Type: String
+    Default: "この料理画像の説明文を150文字でポジティブな感想で作成してください。"
+    Description: Nova に渡すシステムプロンプト（SSM パラメータの既定値）。
+  DescribeModelId:
+    Type: String
+    Default: "global.amazon.nova-2-lite-v1:0"
+    Description: 説明生成に使う Bedrock モデル ID（SSM パラメータの既定値）。
+
+# ---------------------------------------------------------------------------
+# Conditions
+# ---------------------------------------------------------------------------
+Conditions:
+  # Pillow レイヤー ARN が渡されたときだけ画像処理 Lambda にアタッチする。
+  HasPillowLayer: !Not [!Equals [!Ref PillowLayerArn, ""]]
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # =========================================================================
+  # DynamoDB : the meal records table
+  #   PK = UserId
+  #   SK = MealKey  ("YYYY-MM-DD#breakfast|lunch|dinner")
+  #   LSI RatingIndex : PK = UserId, SK = Rating (1-5)
+  #   GSI FavoriteIndex (sparse) : PK = FavoriteFlag, SK = MealDate
+  #     FavoriteFlag exists only when a record is a favorite, so the index is
+  #     sparse and stores favorites only (saves storage + write capacity).
+  # =========================================================================
+  MealsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectName}-meals"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: UserId
+          AttributeType: S
+        - AttributeName: MealKey
+          AttributeType: S
+        - AttributeName: Rating
+          AttributeType: N
+        - AttributeName: FavoriteFlag
+          AttributeType: S
+        - AttributeName: MealDate
+          AttributeType: S
+      KeySchema:
+        - AttributeName: UserId
+          KeyType: HASH
+        - AttributeName: MealKey
+          KeyType: RANGE
+      LocalSecondaryIndexes:
+        - IndexName: RatingIndex
+          KeySchema:
+            - AttributeName: UserId
+              KeyType: HASH
+            - AttributeName: Rating
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      GlobalSecondaryIndexes:
+        - IndexName: FavoriteIndex
+          KeySchema:
+            - AttributeName: FavoriteFlag
+              KeyType: HASH
+            - AttributeName: MealDate
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  # =========================================================================
+  # Cognito : user pool + app client
+  # =========================================================================
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${ProjectName}-user-pool"
+      AutoVerifiedAttributes:
+        - email
+      UsernameConfiguration:
+        CaseSensitive: false
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireUppercase: true
+          RequireSymbols: false
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Mutable: true
+          Required: true
+        - Name: nickname
+          AttributeDataType: String
+          Mutable: true
+          Required: false
+      LambdaConfig:
+        # PreSignUp auto-confirms the user (no email verification needed) and
+        # PostConfirmation runs the "user activated" automation.
+        PreSignUp: !GetAtt CognitoTriggerFunction.Arn
+        PostConfirmation: !GetAtt CognitoTriggerFunction.Arn
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub "${ProjectName}-web-client"
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+
+  CognitoTriggerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref CognitoTriggerFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt UserPool.Arn
+
+  # =========================================================================
+  # IAM roles
+  # =========================================================================
+  CognitoTriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-cognito-trigger-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: cognito-activate
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: cognito-idp:AdminUpdateUserAttributes
+                Resource: "*"
+
+  ApiFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-api-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        # ADOT/X-Ray needs permission to send trace segments.
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: dynamodb-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:BatchWriteItem
+                Resource:
+                  - !GetAtt MealsTable.Arn
+                  - !Sub "${MealsTable.Arn}/index/*"
+
+  # =========================================================================
+  # Cognito trigger Lambda (not part of the API; no alias needed)
+  # =========================================================================
+  CognitoTriggerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-cognito-triggers"
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      Timeout: 10
+      # ログは JSON 形式・アプリケーションログレベル INFO で出力する。
+      LoggingConfig:
+        LogFormat: JSON
+        ApplicationLogLevel: INFO
+        SystemLogLevel: INFO
+      Role: !GetAtt CognitoTriggerRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref CognitoTriggerKey
+
+  # =========================================================================
+  # API Lambda functions (one per operation).
+  # Each: Tracing Active + ADOT layer + wrapper, a published Version, and
+  # prod/test aliases. The deploy script re-publishes versions and repoints
+  # the aliases after uploading fresh code.
+  # =========================================================================
+
+  # ---- put_meal ----
+  PutMealFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-put-meal"
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      Timeout: 15
+      MemorySize: 256
+      Role: !GetAtt ApiFunctionRole.Arn
+      # ログは JSON 形式・アプリケーションログレベル INFO で出力する。
+      LoggingConfig:
+        LogFormat: JSON
+        ApplicationLogLevel: INFO
+        SystemLogLevel: INFO
+      TracingConfig:
+        Mode: Active
+      Layers:
+        - !Ref AdotLayerArn
+      Environment:
+        Variables:
+          MEALS_TABLE: !Ref MealsTable
+          RATING_INDEX: RatingIndex
+          FAVORITE_INDEX: FavoriteIndex
+          AWS_LAMBDA_EXEC_WRAPPER: /opt/otel-instrument
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref PutMealKey
+  PutMealVersion:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref PutMealFunction
+  PutMealAliasProd:
+    Type: AWS::Lambda::Alias
+    Properties:
+      Name: prod
+      FunctionName: !Ref PutMealFunction
+      FunctionVersion: !GetAtt PutMealVersion.Version
+  PutMealAliasTest:
+    Type: AWS::Lambda::Alias
+    Properties:
+      Name: test
+      FunctionName: !Ref PutMealFunction
+      FunctionVersion: !GetAtt PutMealVersion.Version
+
+  # ---- delete_meal ----
+  DeleteMealFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-delete-meal"
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      Timeout: 15
+      MemorySize: 256
+      Role: !GetAtt ApiFunctionRole.Arn
+      # ログは JSON 形式・アプリケーションログレベル INFO で出力する。
+      LoggingConfig:
+        LogFormat: JSON
+        ApplicationLogLevel: INFO
+        SystemLogLevel: INFO
+      TracingConfig:
+        Mode: Active
+      Layers:
+        - !Ref AdotLayerArn
+      Environment:
+        Variables:
+          MEALS_TABLE: !Ref MealsTable
+          RATING_INDEX: RatingIndex
+          FAVORITE_INDEX: FavoriteIndex
+          AWS_LAMBDA_EXEC_WRAPPER: /opt/otel-instrument
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref DeleteMealKey
+  DeleteMealVersion:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref DeleteMealFunction
+  DeleteMealAliasProd:
+    Type: AWS::Lambda::Alias
+    Properties:
+      Name: prod
+      FunctionName: !Ref DeleteMealFunction
+      FunctionVersion: !GetAtt DeleteMealVersion.Version
+  DeleteMealAliasTest:
+    Type: AWS::Lambda::Alias
+    Properties:
+      Name: test
+      FunctionName: !Ref DeleteMealFunction
+      FunctionVersion: !GetAtt DeleteMealVersion.Version
+
+  # ---- list_recent ----
+  ListRecentFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-list-recent"
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      Timeout: 15
+      MemorySize: 256
+      Role: !GetAtt ApiFunctionRole.Arn
+      # ログは JSON 形式・アプリケーションログレベル INFO で出力する。
+      LoggingConfig:
+        LogFormat: JSON
+        ApplicationLogLevel: INFO
+        SystemLogLevel: INFO
+      TracingConfig:
+        Mode: Active
+      Layers:
+        - !Ref AdotLayerArn
+      Environment:
+        Variables:
+          MEALS_TABLE: !Ref MealsTable
+          RATING_INDEX: RatingIndex
+          FAVORITE_INDEX: FavoriteIndex
+          AWS_LAMBDA_EXEC_WRAPPER: /opt/otel-instrument
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref ListRecentKey
+  ListRecentVersion:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref ListRecentFunction
+  ListRecentAliasProd:
+    Type: AWS::Lambda::Alias
+    Properties:
+      Name: prod
+      FunctionName: !Ref ListRecentFunction
+      FunctionVersion: !GetAtt ListRecentVersion.Version
+  ListRecentAliasTest:
+    Type: AWS::Lambda::Alias
+    Properties:
+      Name: test
+      FunctionName: !Ref ListRecentFunction
+      FunctionVersion: !GetAtt ListRecentVersion.Version
+
+  # ---- query_rating (LSI) ----
+  QueryRatingFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-query-rating"
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      Timeout: 15
+      MemorySize: 256
+      Role: !GetAtt ApiFunctionRole.Arn
+      # ログは JSON 形式・アプリケーションログレベル INFO で出力する。
+      LoggingConfig:
+        LogFormat: JSON
+        ApplicationLogLevel: INFO
+        SystemLogLevel: INFO
+      TracingConfig:
+        Mode: Active
+      Layers:
+        - !Ref AdotLayerArn
+      Environment:
+        Variables:
+          MEALS_TABLE: !Ref MealsTable
+          RATING_INDEX: RatingIndex
+          FAVORITE_INDEX: FavoriteIndex
+          AWS_LAMBDA_EXEC_WRAPPER: /opt/otel-instrument
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref QueryRatingKey
+  QueryRatingVersion:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref QueryRatingFunction
+  QueryRatingAliasProd:
+    Type: AWS::Lambda::Alias
+    Properties:
+      Name: prod
+      FunctionName: !Ref QueryRatingFunction
+      FunctionVersion: !GetAtt QueryRatingVersion.Version
+  QueryRatingAliasTest:
+    Type: AWS::Lambda::Alias
+    Properties:
+      Name: test
+      FunctionName: !Ref QueryRatingFunction
+      FunctionVersion: !GetAtt QueryRatingVersion.Version
+
+  # ---- query_favorite (sparse GSI) ----
+  QueryFavoriteFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-query-favorite"
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      Timeout: 15
+      MemorySize: 256
+      Role: !GetAtt ApiFunctionRole.Arn
+      # ログは JSON 形式・アプリケーションログレベル INFO で出力する。
+      LoggingConfig:
+        LogFormat: JSON
+        ApplicationLogLevel: INFO
+        SystemLogLevel: INFO
+      TracingConfig:
+        Mode: Active
+      Layers:
+        - !Ref AdotLayerArn
+      Environment:
+        Variables:
+          MEALS_TABLE: !Ref MealsTable
+          RATING_INDEX: RatingIndex
+          FAVORITE_INDEX: FavoriteIndex
+          AWS_LAMBDA_EXEC_WRAPPER: /opt/otel-instrument
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref QueryFavoriteKey
+  QueryFavoriteVersion:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref QueryFavoriteFunction
+  QueryFavoriteAliasProd:
+    Type: AWS::Lambda::Alias
+    Properties:
+      Name: prod
+      FunctionName: !Ref QueryFavoriteFunction
+      FunctionVersion: !GetAtt QueryFavoriteVersion.Version
+  QueryFavoriteAliasTest:
+    Type: AWS::Lambda::Alias
+    Properties:
+      Name: test
+      FunctionName: !Ref QueryFavoriteFunction
+      FunctionVersion: !GetAtt QueryFavoriteVersion.Version
+
+  # =========================================================================
+  # API Gateway (REST API) with a Cognito authorizer + Lambda proxy.
+  # The integration URIs embed the stage variable "lambdaAlias" so the prod
+  # stage calls the :prod aliases and the test stage calls the :test aliases.
+  #
+  #   GET    /meals                -> list_recent
+  #   POST   /meals                -> put_meal
+  #   DELETE /meals/{mealKey}      -> delete_meal
+  #   GET    /meals/search/rating  -> query_rating (LSI)
+  #   GET    /meals/favorites      -> query_favorite (sparse GSI)
+  # =========================================================================
+  RestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${ProjectName}-api"
+      EndpointConfiguration:
+        Types: [REGIONAL]
+
+  CognitoAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: !Sub "${ProjectName}-cognito-authorizer"
+      RestApiId: !Ref RestApi
+      Type: COGNITO_USER_POOLS
+      IdentitySource: method.request.header.Authorization
+      ProviderARNs:
+        - !GetAtt UserPool.Arn
+
+  # ---- resources ----
+  MealsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: meals
+  MealKeyResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref MealsResource
+      PathPart: "{mealKey}"
+  SearchResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref MealsResource
+      PathPart: search
+  SearchRatingResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref SearchResource
+      PathPart: rating
+  FavoritesResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref MealsResource
+      PathPart: favorites
+
+  # ---- methods ----
+  # NOTE: the ":${stageVariables.lambdaAlias}" suffix on the function ARN makes
+  # API Gateway invoke the alias named by the stage variable (prod or test).
+  ListRecentMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref MealsResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ListRecentFunction.Arn}:${!stageVariables.lambdaAlias}/invocations"
+
+  PutMealMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref MealsResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PutMealFunction.Arn}:${!stageVariables.lambdaAlias}/invocations"
+
+  DeleteMealMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref MealKeyResource
+      HttpMethod: DELETE
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DeleteMealFunction.Arn}:${!stageVariables.lambdaAlias}/invocations"
+
+  QueryRatingMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref SearchRatingResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${QueryRatingFunction.Arn}:${!stageVariables.lambdaAlias}/invocations"
+
+  QueryFavoriteMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref FavoritesResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${QueryFavoriteFunction.Arn}:${!stageVariables.lambdaAlias}/invocations"
+
+  # ---- CORS preflight (MOCK) ----
+  MealsOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref MealsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates: { application/json: '{"statusCode": 200}' }
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates: { application/json: "" }
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  MealKeyOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref MealKeyResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates: { application/json: '{"statusCode": 200}' }
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates: { application/json: "" }
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  SearchRatingOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref SearchRatingResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates: { application/json: '{"statusCode": 200}' }
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates: { application/json: "" }
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  FavoritesOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref FavoritesResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates: { application/json: '{"statusCode": 200}' }
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates: { application/json: "" }
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # ---- Lambda invoke permissions (per alias) ----
+  # API Gateway must be allowed to invoke each prod and test alias.
+  PutMealPermProd:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref PutMealAliasProd
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/*"
+  PutMealPermTest:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref PutMealAliasTest
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/*"
+
+  DeleteMealPermProd:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref DeleteMealAliasProd
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/*"
+  DeleteMealPermTest:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref DeleteMealAliasTest
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/*"
+
+  ListRecentPermProd:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ListRecentAliasProd
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/*"
+  ListRecentPermTest:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ListRecentAliasTest
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/*"
+
+  QueryRatingPermProd:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref QueryRatingAliasProd
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/*"
+  QueryRatingPermTest:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref QueryRatingAliasTest
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/*"
+
+  QueryFavoritePermProd:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref QueryFavoriteAliasProd
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/*"
+  QueryFavoritePermTest:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref QueryFavoriteAliasTest
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/*"
+
+  # ---- deployment + two stages (prod/test) selecting the alias ----
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ListRecentMethod
+      - PutMealMethod
+      - DeleteMealMethod
+      - QueryRatingMethod
+      - QueryFavoriteMethod
+      - MealsOptions
+      - MealKeyOptions
+      - SearchRatingOptions
+      - FavoritesOptions
+      - GetUploadUrlMethod
+      - GetImageUrlMethod
+      - ImageUrlOptions
+      - ImageOptions
+    Properties:
+      RestApiId: !Ref RestApi
+
+  # スロットリングはステージごとに設定（受講者最大 20 名を想定）。
+  # MethodSettings の "*/*" でステージ全体の既定レート/バーストを指定する。
+  ApiStageProd:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      StageName: prod
+      RestApiId: !Ref RestApi
+      DeploymentId: !Ref ApiDeployment
+      TracingEnabled: true
+      Variables:
+        lambdaAlias: prod
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          # 本番デモ用: 20 名の同時操作を吸収しつつ乱打は抑制。
+          ThrottlingRateLimit: 50
+          ThrottlingBurstLimit: 100
+
+  ApiStageTest:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      StageName: test
+      RestApiId: !Ref RestApi
+      DeploymentId: !Ref ApiDeployment
+      TracingEnabled: true
+      Variables:
+        lambdaAlias: test
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          # 検証用: 本番より絞る。
+          ThrottlingRateLimit: 20
+          ThrottlingBurstLimit: 40
+
+  # =========================================================================
+  # Frontend hosting : private S3 bucket behind CloudFront (OAC)
+  # =========================================================================
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-frontend-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  CloudFrontOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${ProjectName}-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # ---- WAF: UI(CloudFront) 向けレートベースブロック ----
+  # Scope=CLOUDFRONT の WebACL は us-east-1 で作成する必要がある
+  # （本スタックは us-east-1 なので同一テンプレートに置ける）。
+  # 既定は許可し、同一 IP から 5 分あたり 2000 リクエストを超えたらブロック。
+  FrontendWebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub "${ProjectName}-frontend-webacl"
+      Scope: CLOUDFRONT
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub "${ProjectName}-frontend-webacl"
+      Rules:
+        - Name: RateLimitPerIp
+          Priority: 0
+          Action:
+            Block: {}
+          Statement:
+            RateBasedStatement:
+              # 5 分あたりの同一 IP からのリクエスト数（最小 100）。
+              Limit: 2000
+              AggregateKeyType: IP
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub "${ProjectName}-rate-limit"
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${ProjectName} frontend distribution"
+        # UI（CloudFront）に WAF のレートベースブロックを適用。
+        WebACLId: !GetAtt FrontendWebAcl.Arn
+        DefaultRootObject: index.html
+        # To attach doademo.aws.trainocate.biz later: add Aliases + a
+        # ViewerCertificate referencing an ACM cert in us-east-1, then create
+        # the Route 53 record pointing at this distribution.
+        Origins:
+          - Id: s3-frontend
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !Ref CloudFrontOAC
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: s3-frontend
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          # CachingDisabled managed policy so config.js updates appear immediately.
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+        PriceClass: PriceClass_100
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipalReadOnly
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${FrontendBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}"
+
+  # =========================================================================
+  # 画像アップロード機能（追加仕様）
+  #   アップロードS3 --(ObjectCreated)--> SNS --> SQS x2 (RAW, 各DLQ)
+  #     SQS-A --> process_image (Pillowでweb/thumb生成, 出力S3, DynamoDB更新)
+  #     SQS-B --> describe_image (Bedrock Novaで説明生成, DynamoDB更新)
+  #   成功/失敗の送信先は EventBridge。処理済み画像は署名付きURLで参照。
+  # =========================================================================
+
+  # ---- S3: アップロード用（非公開）----
+  UploadBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-uploads-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      CorsConfiguration:
+        # ブラウザから署名付き URL で直接 PUT するため CORS を許可。
+        CorsRules:
+          - AllowedMethods: [PUT]
+            AllowedOrigins: ["*"]
+            AllowedHeaders: ["*"]
+            MaxAge: 3000
+      NotificationConfiguration:
+        TopicConfigurations:
+          - Event: s3:ObjectCreated:*
+            Topic: !Ref ImageTopic
+    DependsOn: ImageTopicPolicy
+
+  # ---- S3: 出力用（非公開・署名付きURLで参照）----
+  OutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-images-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+
+  # ---- SNS トピック（S3 イベントのファンアウト）----
+  ImageTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-image-events"
+
+  ImageTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref ImageTopic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowS3Publish
+            Effect: Allow
+            Principal: { Service: s3.amazonaws.com }
+            Action: sns:Publish
+            Resource: !Ref ImageTopic
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub "arn:aws:s3:::${ProjectName}-uploads-${AWS::AccountId}"
+
+  # ---- SQS: 2 キュー + それぞれ DLQ ----
+  ProcessQueueDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-process-dlq"
+      MessageRetentionPeriod: 1209600
+  ProcessQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-process-queue"
+      VisibilityTimeout: 120
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ProcessQueueDLQ.Arn
+        maxReceiveCount: 3
+
+  DescribeQueueDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-describe-dlq"
+      MessageRetentionPeriod: 1209600
+  DescribeQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-describe-queue"
+      VisibilityTimeout: 120
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DescribeQueueDLQ.Arn
+        maxReceiveCount: 3
+
+  # SNS -> 各 SQS のサブスクリプション（RAW メッセージ配信）
+  ProcessSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref ImageTopic
+      Protocol: sqs
+      Endpoint: !GetAtt ProcessQueue.Arn
+      RawMessageDelivery: true
+  DescribeSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref ImageTopic
+      Protocol: sqs
+      Endpoint: !GetAtt DescribeQueue.Arn
+      RawMessageDelivery: true
+
+  # SNS が SQS へ送信できるようにするキューポリシー
+  QueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref ProcessQueue, !Ref DescribeQueue]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowSNSSend
+            Effect: Allow
+            Principal: { Service: sns.amazonaws.com }
+            Action: sqs:SendMessage
+            Resource: "*"
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref ImageTopic
+
+  # ---- SSM パラメータ（システムプロンプト / モデル ID）----
+  SystemPromptParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ProjectName}/describe/system-prompt"
+      Type: String
+      Value: !Ref DescribeSystemPrompt
+  ModelIdParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ProjectName}/describe/model-id"
+      Type: String
+      Value: !Ref DescribeModelId
+
+  # ---- IAM: 画像系 API Lambda（署名付きURL発行）----
+  ImageApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-image-api-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: image-api
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:PutObject]
+                Resource: !Sub "arn:aws:s3:::${ProjectName}-uploads-${AWS::AccountId}/*"
+              - Effect: Allow
+                Action: [s3:GetObject]
+                Resource: !Sub "arn:aws:s3:::${ProjectName}-images-${AWS::AccountId}/*"
+              - Effect: Allow
+                Action: [dynamodb:GetItem]
+                Resource: !GetAtt MealsTable.Arn
+
+  # ---- IAM: 画像処理 Lambda A ----
+  ProcessImageRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-process-image-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: process-image
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes]
+                Resource: !GetAtt ProcessQueue.Arn
+              - Effect: Allow
+                Action: [s3:GetObject]
+                Resource: !Sub "arn:aws:s3:::${ProjectName}-uploads-${AWS::AccountId}/*"
+              - Effect: Allow
+                Action: [s3:PutObject]
+                Resource: !Sub "arn:aws:s3:::${ProjectName}-images-${AWS::AccountId}/*"
+              - Effect: Allow
+                Action: [dynamodb:UpdateItem]
+                Resource: !GetAtt MealsTable.Arn
+
+  # ---- IAM: 説明生成 Lambda B ----
+  DescribeImageRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-describe-image-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: describe-image
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes]
+                Resource: !GetAtt DescribeQueue.Arn
+              - Effect: Allow
+                Action: [s3:GetObject]
+                Resource: !Sub "arn:aws:s3:::${ProjectName}-uploads-${AWS::AccountId}/*"
+              - Effect: Allow
+                Action: [dynamodb:UpdateItem]
+                Resource: !GetAtt MealsTable.Arn
+              - Effect: Allow
+                Action: [ssm:GetParameter]
+                Resource:
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/describe/*"
+              - Effect: Allow
+                Action: [bedrock:InvokeModel]
+                Resource: "*"
+
+  # ---- Lambda: get_upload_url（API, prod/test エイリアス）----
+  GetUploadUrlFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-get-upload-url"
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      Timeout: 15
+      MemorySize: 256
+      Role: !GetAtt ImageApiRole.Arn
+      LoggingConfig: { LogFormat: JSON, ApplicationLogLevel: INFO, SystemLogLevel: INFO }
+      TracingConfig: { Mode: Active }
+      Layers: [!Ref AdotLayerArn]
+      Environment:
+        Variables:
+          MEALS_TABLE: !Ref MealsTable
+          UPLOAD_BUCKET: !Sub "${ProjectName}-uploads-${AWS::AccountId}"
+          AWS_LAMBDA_EXEC_WRAPPER: /opt/otel-instrument
+      Code: { S3Bucket: !Ref LambdaCodeBucket, S3Key: !Ref GetUploadUrlKey }
+  GetUploadUrlVersion:
+    Type: AWS::Lambda::Version
+    Properties: { FunctionName: !Ref GetUploadUrlFunction }
+  GetUploadUrlAliasProd:
+    Type: AWS::Lambda::Alias
+    Properties: { Name: prod, FunctionName: !Ref GetUploadUrlFunction, FunctionVersion: !GetAtt GetUploadUrlVersion.Version }
+  GetUploadUrlAliasTest:
+    Type: AWS::Lambda::Alias
+    Properties: { Name: test, FunctionName: !Ref GetUploadUrlFunction, FunctionVersion: !GetAtt GetUploadUrlVersion.Version }
+
+  # ---- Lambda: get_image_url（API, prod/test エイリアス）----
+  GetImageUrlFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-get-image-url"
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      Timeout: 15
+      MemorySize: 256
+      Role: !GetAtt ImageApiRole.Arn
+      LoggingConfig: { LogFormat: JSON, ApplicationLogLevel: INFO, SystemLogLevel: INFO }
+      TracingConfig: { Mode: Active }
+      Layers: [!Ref AdotLayerArn]
+      Environment:
+        Variables:
+          MEALS_TABLE: !Ref MealsTable
+          OUTPUT_BUCKET: !Sub "${ProjectName}-images-${AWS::AccountId}"
+          AWS_LAMBDA_EXEC_WRAPPER: /opt/otel-instrument
+      Code: { S3Bucket: !Ref LambdaCodeBucket, S3Key: !Ref GetImageUrlKey }
+  GetImageUrlVersion:
+    Type: AWS::Lambda::Version
+    Properties: { FunctionName: !Ref GetImageUrlFunction }
+  GetImageUrlAliasProd:
+    Type: AWS::Lambda::Alias
+    Properties: { Name: prod, FunctionName: !Ref GetImageUrlFunction, FunctionVersion: !GetAtt GetImageUrlVersion.Version }
+  GetImageUrlAliasTest:
+    Type: AWS::Lambda::Alias
+    Properties: { Name: test, FunctionName: !Ref GetImageUrlFunction, FunctionVersion: !GetAtt GetImageUrlVersion.Version }
+
+  # ---- Lambda: process_image（SQS ESM, デスティネーション=EventBridge）----
+  ProcessImageFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-process-image"
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      Timeout: 60
+      MemorySize: 1024
+      Role: !GetAtt ProcessImageRole.Arn
+      LoggingConfig: { LogFormat: JSON, ApplicationLogLevel: INFO, SystemLogLevel: INFO }
+      TracingConfig: { Mode: Active }
+      # ADOT と Pillow の両レイヤー（Pillow は deploy.sh が発行した ARN）
+      Layers: !If
+        - HasPillowLayer
+        - [!Ref AdotLayerArn, !Ref PillowLayerArn]
+        - [!Ref AdotLayerArn]
+      Environment:
+        Variables:
+          MEALS_TABLE: !Ref MealsTable
+          OUTPUT_BUCKET: !Sub "${ProjectName}-images-${AWS::AccountId}"
+          AWS_LAMBDA_EXEC_WRAPPER: /opt/otel-instrument
+      Code: { S3Bucket: !Ref LambdaCodeBucket, S3Key: !Ref ProcessImageKey }
+
+  ProcessImageESM:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt ProcessQueue.Arn
+      FunctionName: !Ref ProcessImageFunction
+      BatchSize: 1
+      Enabled: true
+
+  # ---- Lambda: describe_image（SQS ESM, デスティネーション=EventBridge）----
+  DescribeImageFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-describe-image"
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      Timeout: 60
+      MemorySize: 512
+      Role: !GetAtt DescribeImageRole.Arn
+      LoggingConfig: { LogFormat: JSON, ApplicationLogLevel: INFO, SystemLogLevel: INFO }
+      TracingConfig: { Mode: Active }
+      Layers: [!Ref AdotLayerArn]
+      Environment:
+        Variables:
+          MEALS_TABLE: !Ref MealsTable
+          SYSTEM_PROMPT_PARAM: !Sub "/${ProjectName}/describe/system-prompt"
+          MODEL_ID_PARAM: !Sub "/${ProjectName}/describe/model-id"
+          AWS_LAMBDA_EXEC_WRAPPER: /opt/otel-instrument
+      Code: { S3Bucket: !Ref LambdaCodeBucket, S3Key: !Ref DescribeImageKey }
+
+  DescribeImageESM:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt DescribeQueue.Arn
+      FunctionName: !Ref DescribeImageFunction
+      BatchSize: 1
+      Enabled: true
+
+  # ---- API Gateway: 画像用リソース/メソッド ----
+  #   POST /meals/{mealKey}/image-url -> get_upload_url（アップロード用URL）
+  #   GET  /meals/{mealKey}/image     -> get_image_url（参照用URL）
+  ImageUrlResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref MealKeyResource
+      PathPart: image-url
+  ImageResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref MealKeyResource
+      PathPart: image
+
+  GetUploadUrlMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref ImageUrlResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetUploadUrlFunction.Arn}:${!stageVariables.lambdaAlias}/invocations"
+  GetImageUrlMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref ImageResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetImageUrlFunction.Arn}:${!stageVariables.lambdaAlias}/invocations"
+
+  ImageUrlOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref ImageUrlResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates: { application/json: '{"statusCode": 200}' }
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates: { application/json: "" }
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+  ImageOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref ImageResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates: { application/json: '{"statusCode": 200}' }
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates: { application/json: "" }
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # 画像系 API の Lambda 呼び出し許可（prod/test 両エイリアス）
+  GetUploadUrlPermProd:
+    Type: AWS::Lambda::Permission
+    Properties: { Action: lambda:InvokeFunction, FunctionName: !Ref GetUploadUrlAliasProd, Principal: apigateway.amazonaws.com, SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/*" }
+  GetUploadUrlPermTest:
+    Type: AWS::Lambda::Permission
+    Properties: { Action: lambda:InvokeFunction, FunctionName: !Ref GetUploadUrlAliasTest, Principal: apigateway.amazonaws.com, SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/*" }
+  GetImageUrlPermProd:
+    Type: AWS::Lambda::Permission
+    Properties: { Action: lambda:InvokeFunction, FunctionName: !Ref GetImageUrlAliasProd, Principal: apigateway.amazonaws.com, SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/*" }
+  GetImageUrlPermTest:
+    Type: AWS::Lambda::Permission
+    Properties: { Action: lambda:InvokeFunction, FunctionName: !Ref GetImageUrlAliasTest, Principal: apigateway.amazonaws.com, SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/*" }
+
+# ---------------------------------------------------------------------------
+# Outputs (consumed by deploy.sh)
+# ---------------------------------------------------------------------------
+Outputs:
+  Region:
+    Value: !Ref AWS::Region
+  MealsTableName:
+    Value: !Ref MealsTable
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  ApiBaseUrl:
+    Description: Base URL of the PROD stage (prod aliases)
+    Value: !Sub "https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+  ApiBaseUrlTest:
+    Description: Base URL of the TEST stage (test aliases)
+    Value: !Sub "https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/test"
+  ApiFunctionNames:
+    Description: Comma separated API Lambda function names (used by deploy.sh to publish versions)
+    Value: !Join
+      - ","
+      - - !Ref PutMealFunction
+        - !Ref DeleteMealFunction
+        - !Ref ListRecentFunction
+        - !Ref QueryRatingFunction
+        - !Ref QueryFavoriteFunction
+        - !Ref GetUploadUrlFunction
+        - !Ref GetImageUrlFunction
+  UploadBucketName:
+    Value: !Ref UploadBucket
+  OutputBucketName:
+    Value: !Ref OutputBucket
+  FrontendBucketName:
+    Value: !Ref FrontendBucket
+  CloudFrontDomainName:
+    Value: !GetAtt CloudFrontDistribution.DomainName
+  CloudFrontDistributionId:
+    Value: !Ref CloudFrontDistribution
+  FrontendWebAclArn:
+    Description: WAF WebACL (CloudFront) protecting the UI with a rate-based rule
+    Value: !GetAtt FrontendWebAcl.Arn
+  AppUrl:
+    Description: Open this URL to use the app
+    Value: !Sub "https://${CloudFrontDistribution.DomainName}"

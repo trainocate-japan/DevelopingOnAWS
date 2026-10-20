@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MealLog - 食事記録デモ</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header>
+    <h1>🍽️ MealLog</h1>
+    <p class="tagline">食べたものを記録する健康管理デモアプリ</p>
+    <div id="userBar" class="user-bar hidden">
+      <span id="whoami"></span>
+      <button id="signOutBtn" class="link-btn">サインアウト</button>
+    </div>
+  </header>
+
+  <main>
+    <!-- ============ Auth view ============ -->
+    <section id="authView" class="card">
+      <div class="tabs">
+        <button id="tabSignIn" class="tab active">サインイン</button>
+        <button id="tabSignUp" class="tab">サインアップ（新規作成）</button>
+      </div>
+
+      <!-- Sign in -->
+      <form id="signInForm" class="auth-form">
+        <label>ユーザー名
+          <input type="text" id="siUsername" autocomplete="username" required />
+        </label>
+        <label>パスワード
+          <input type="password" id="siPassword" autocomplete="current-password" required />
+        </label>
+        <button type="submit" class="primary">サインイン</button>
+      </form>
+
+      <!-- Sign up -->
+      <form id="signUpForm" class="auth-form hidden">
+        <p class="hint">
+          ボタンを押すと、架空のユーザー名・メールアドレス・パスワードを自動生成してアカウントを作成します。
+          個人情報の入力は不要です。作成後、ログイン情報を画面に表示します。
+        </p>
+        <button type="submit" class="primary">架空ユーザーを作成する</button>
+        <div id="credentialBox" class="credential-box hidden">
+          <h3>作成したログイン情報</h3>
+          <p>この情報でサインインしてください（デモ用の架空アカウントです）。</p>
+          <table>
+            <tr><th>ユーザー名</th><td id="genUsername"></td></tr>
+            <tr><th>メール</th><td id="genEmail"></td></tr>
+            <tr><th>パスワード</th><td id="genPassword"></td></tr>
+          </table>
+          <button type="button" id="goSignInBtn" class="primary">この情報でサインイン画面へ</button>
+        </div>
+      </form>
+
+      <p id="authMsg" class="msg"></p>
+    </section>
+
+    <!-- ============ App view ============ -->
+    <section id="appView" class="hidden">
+      <div class="card">
+        <h2>食事を記録する</h2>
+        <form id="mealForm" class="meal-form">
+          <label>日付
+            <input type="date" id="mealDate" required />
+          </label>
+          <label>時間帯
+            <select id="mealSlot" required>
+              <option value="breakfast">朝</option>
+              <option value="lunch">昼</option>
+              <option value="dinner">夜</option>
+            </select>
+          </label>
+          <label>メニュー
+            <input type="text" id="mealMenu" placeholder="例: 鮭の塩焼き定食" required />
+          </label>
+          <label>評価
+            <select id="mealRating" required>
+              <option value="5">★★★★★</option>
+              <option value="4">★★★★☆</option>
+              <option value="3">★★★☆☆</option>
+              <option value="2">★★☆☆☆</option>
+              <option value="1">★☆☆☆☆</option>
+            </select>
+          </label>
+          <label class="checkbox">
+            <input type="checkbox" id="mealFavorite" /> お気に入り
+          </label>
+          <p class="note">チェックを入れると他の人にも表示されます</p>
+          <button type="submit" class="primary">保存</button>
+        </form>
+        <p id="mealMsg" class="msg"></p>
+      </div>
+
+      <div class="card">
+        <h2>記録を見る</h2>
+        <div class="target-user">
+          <label>対象ユーザー
+            <select id="targetUser">
+              <option value="">自分</option>
+              <!-- サンプルユーザーは config.js に sub があれば app.js が追加 -->
+            </select>
+          </label>
+          <span class="note">※「最近の記録」と「評価で検索」の対象を切り替えます（お気に入りは全員共通）</span>
+        </div>
+        <div class="filters">
+          <button data-mode="recent" class="filter active">最近の記録（ベーステーブル）</button>
+          <button data-mode="rating" class="filter">評価で検索（LSI）</button>
+          <button data-mode="favorite" class="filter">お気に入り（GSI・スパース）</button>
+        </div>
+
+        <!-- ベーステーブル: ソートキー(日付#時間帯)の範囲検索 -->
+        <div id="recentControls" class="range-controls">
+          <span class="range-note">ソートキー（日付 + 時間帯）の範囲で検索します（1=朝, 2=昼, 3=夜）</span>
+          <div class="range-row">
+            <label>日付(開始)<input type="date" id="dateFrom" /></label>
+            <label>日付(終了)<input type="date" id="dateTo" /></label>
+          </div>
+          <div class="range-row">
+            <label>単一日<input type="date" id="dateSingle" /></label>
+            <label>時間帯(下限)
+              <select id="slotFrom"><option value="1">朝</option><option value="2">昼</option><option value="3">夜</option></select>
+            </label>
+            <label>時間帯(上限)
+              <select id="slotTo"><option value="1">朝</option><option value="2">昼</option><option value="3" selected>夜</option></select>
+            </label>
+          </div>
+          <div class="range-row">
+            <button type="button" id="recentSearch" class="primary small">検索</button>
+            <button type="button" id="recentReset" class="link-btn">条件クリア</button>
+            <span class="range-note">※「単一日」を入れると時間帯の範囲が有効。空なら日付(開始/終了)の範囲で検索</span>
+          </div>
+        </div>
+
+        <!-- GSI: お気に入りの日付範囲検索（全ユーザー共通） -->
+        <div id="favoriteControls" class="range-controls hidden">
+          <span class="range-note">GSI のソートキー（日付）に対する範囲検索。全ユーザーのお気に入りが対象です</span>
+          <div class="range-row">
+            <label>日付(開始)<input type="date" id="favDateFrom" /></label>
+            <label>日付(終了)<input type="date" id="favDateTo" /></label>
+            <button type="button" id="favoriteSearch" class="primary small">検索</button>
+            <button type="button" id="favoriteReset" class="link-btn">条件クリア</button>
+          </div>
+        </div>
+
+        <!-- LSI: 評価の範囲検索 -->
+        <div id="ratingControls" class="range-controls hidden">
+          <span class="range-note">LSI のソートキー（評価）に対する範囲検索</span>
+          <div class="range-row">
+            <label>検索方法
+              <select id="ratingMode">
+                <option value="exact">ちょうど</option>
+                <option value="gte">以上</option>
+                <option value="lte">以下</option>
+                <option value="between">範囲</option>
+              </select>
+            </label>
+            <label>評価
+              <select id="ratingA"><option value="5">★5</option><option value="4">★4</option><option value="3">★3</option><option value="2">★2</option><option value="1">★1</option></select>
+            </label>
+            <label id="ratingBWrap" class="hidden">〜
+              <select id="ratingB"><option value="5">★5</option><option value="4">★4</option><option value="3">★3</option><option value="2">★2</option><option value="1" selected>★1</option></select>
+            </label>
+            <button type="button" id="ratingSearch" class="primary small">検索</button>
+          </div>
+        </div>
+        <p id="listInfo" class="list-info"></p>
+        <table class="meals-table">
+          <thead>
+            <tr><th>写真</th><th>日付</th><th>時間帯</th><th>メニュー</th><th>評価</th><th>★</th><th>登録者</th><th></th></tr>
+          </thead>
+          <tbody id="mealsBody"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <p>Developing on AWS デモ: S3 → DynamoDB → Lambda → API Gateway → S3 + CloudFront → Cognito</p>
+  </footer>
+
+  <!-- 画像アップロード用の隠しファイル入力 -->
+  <input type="file" id="photoInput" accept="image/jpeg,image/png,image/webp" class="hidden" />
+
+  <!-- 料理写真のポップアップ -->
+  <div id="photoModal" class="modal hidden">
+    <div class="modal-backdrop" id="modalBackdrop"></div>
+    <div class="modal-box">
+      <button class="modal-close" id="modalClose">×</button>
+      <img id="modalImage" alt="料理写真" />
+      <p id="modalDesc" class="modal-desc"></p>
+    </div>
+  </div>
+
+  <!-- amazon-cognito-identity-js (browser build) -->
+  <script src="https://cdn.jsdelivr.net/npm/amazon-cognito-identity-js@6.3.12/dist/amazon-cognito-identity.min.js"></script>
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
